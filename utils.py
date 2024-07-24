@@ -1,7 +1,10 @@
 import pandas as pd
 from plotly import graph_objects as go
 import matplotlib.pyplot as plt
-from typing import Tuple
+from typing import Tuple, Union
+from astral.sun import sun
+from astral import LocationInfo
+import numpy as np
 
 
 def split_data(df: pd.DataFrame,
@@ -120,6 +123,238 @@ def plot_zoomed_time_series(data: pd.DataFrame, zoom_range: Tuple[str, str],
 
     plt.subplots_adjust(hspace=1)
     plt.show()
+
+
+def plot_predictions_vs_real(data_test: pd.DataFrame,
+                             predictions: pd.DataFrame,
+                             demand_column: str = 'Demand',
+                             prediction_column: str = 'pred',
+                             title: str = "Real value vs predicted in test data",
+                             figsize: Tuple[int, int] = (800, 400)) -> None:
+    """
+    Trace les prédictions par rapport aux valeurs réelles en utilisant plotly pour l'interactivité.
+
+    Parameters:
+    data_test (pd.DataFrame): DataFrame contenant les données de test réelles.
+    predictions (pd.DataFrame): DataFrame contenant les données de prédiction.
+    demand_column (str): Le nom de la colonne des demandes dans les données de test.
+    prediction_column (str): Le nom de la colonne des prédictions dans les données de prédiction.
+    title (str): Titre du graphique.
+    figsize (Tuple[int, int]): Taille de la figure (width, height).
+    """
+    fig = go.Figure()
+
+    # Tracé des données de test réelles
+    fig.add_trace(go.Scatter(
+        x=data_test.index,
+        y=data_test[demand_column],
+        mode='lines',
+        name='Test',
+        line=dict(color='blue', width=2)
+    ))
+
+    # Tracé des prédictions
+    fig.add_trace(go.Scatter(
+        x=predictions.index,
+        y=predictions[prediction_column],
+        mode='lines',
+        name='Prediction',
+        line=dict(color='red', width=2)
+    ))
+
+    # Mise à jour de la mise en page du graphique
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date time",
+        yaxis_title="Demand",
+        width=figsize[0],
+        height=figsize[1],
+        margin=dict(l=20, r=20, t=35, b=20),
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=1.1,
+            xanchor="left",
+            x=0.001
+        )
+    )
+
+    # Affichage du graphique
+    fig.show()
+
+
+def add_exogenous_features(data: pd.DataFrame,
+                           name: str,
+                           region: str,
+                           timezone: str,
+                           latitude: Union[float, str],
+                           longitude: Union[float, str]) -> pd.DataFrame:
+    """
+    Ajoute des variables exogènes au DataFrame, y compris les caractéristiques du calendrier,
+    la lumière du soleil, les jours fériés et les caractéristiques de la température.
+
+    Parameters:
+    data (pd.DataFrame): DataFrame contenant les données de base avec des colonnes de temps et de température.
+    name (str): Nom de la localisation.
+    region (str): Région de la localisation.
+    timezone (str): Fuseau horaire de la localisation.
+    latitude (Union[float, str]): Latitude de la localisation.
+    longitude (Union[float, str]): Longitude de la localisation.
+
+    Returns:
+    pd.DataFrame: DataFrame contenant les caractéristiques exogènes ajoutées.
+    """
+
+    # Caractéristiques du calendrier
+    calendar_features = pd.DataFrame(index=data.index)
+    calendar_features['month'] = data.index.month
+    calendar_features['week_of_year'] = data.index.isocalendar().week
+    calendar_features['week_day'] = data.index.dayofweek + 1
+    calendar_features['hour_day'] = data.index.hour + 1
+
+    # Caractéristiques de la lumière du soleil avec valeurs fixes pour sunrise et sunset
+    sun_light_features = pd.DataFrame(index=data.index)
+    sun_light_features['sunrise_hour'] = 6
+    sun_light_features['sunset_hour'] = 20
+    sun_light_features['daylight_hours'] = sun_light_features['sunset_hour'] - sun_light_features['sunrise_hour']
+    sun_light_features['is_daylight'] = np.where(
+        (data.index.hour >= sun_light_features['sunrise_hour']) &
+        (data.index.hour < sun_light_features['sunset_hour']),
+        1,
+        0
+    )
+
+    # Caractéristiques des jours fériés
+    holiday_features = data[['Holiday']].astype(int)
+    holiday_features['holiday_previous_day'] = holiday_features['Holiday'].shift(24, fill_value=0)
+    holiday_features['holiday_next_day'] = holiday_features['Holiday'].shift(-24, fill_value=0)
+
+    # Caractéristiques de la température
+    temp_features = data[['Temperature']].copy()
+    temp_features['temp_roll_mean_1_day'] = temp_features['Temperature'].rolling(24, min_periods=1).mean()
+    temp_features['temp_roll_mean_7_day'] = temp_features['Temperature'].rolling(24 * 7, min_periods=1).mean()
+    temp_features['temp_roll_max_1_day'] = temp_features['Temperature'].rolling(24, min_periods=1).max()
+    temp_features['temp_roll_min_1_day'] = temp_features['Temperature'].rolling(24, min_periods=1).min()
+    temp_features['temp_roll_max_7_day'] = temp_features['Temperature'].rolling(24 * 7, min_periods=1).max()
+    temp_features['temp_roll_min_7_day'] = temp_features['Temperature'].rolling(24 * 7, min_periods=1).min()
+
+    # Fusion de toutes les caractéristiques exogènes
+    exogenous_features = pd.concat([
+        calendar_features,
+        sun_light_features,
+        temp_features,
+        holiday_features
+    ], axis=1)
+
+    return exogenous_features
+
+
+def cyclical_encoding(data: pd.Series, cycle_length: int) -> pd.DataFrame:
+    """
+    Encode a cyclical feature with two new features sine and cosine.
+    The minimum value of the feature is assumed to be 0. The maximum value
+    of the feature is passed as an argument.
+
+    Parameters
+    ----------
+    data : pd.Series
+        Series with the feature to encode.
+    cycle_length : int
+        The length of the cycle. For example, 12 for months, 24 for hours, etc.
+        This value is used to calculate the angle of the sin and cos.
+
+    Returns
+    -------
+    result : pd.DataFrame
+        Dataframe with the two new features sin and cos.
+
+    """
+
+    sin = np.sin(2 * np.pi * data / cycle_length)
+    cos = np.cos(2 * np.pi * data / cycle_length)
+    result = pd.DataFrame({
+        f"{data.name}_sin": sin,
+        f"{data.name}_cos": cos
+    })
+
+    return result
+
+
+def plot_prediction_intervals_vs_real(predictions: pd.DataFrame,
+                                      data_test: pd.DataFrame,
+                                      pred_column: str = 'pred',
+                                      demand_column: str = 'Demand',
+                                      upper_bound_column: str = 'upper_bound',
+                                      lower_bound_column: str = 'lower_bound',
+                                      title: str = "Real value vs predicted in test data",
+                                      figsize: Tuple[int, int] = (800, 400)) -> None:
+    """
+    Trace les intervalles de prédiction par rapport aux valeurs réelles en utilisant plotly.
+
+    Parameters:
+    predictions (pd.DataFrame): DataFrame contenant les prédictions et les intervalles de confiance.
+    data_test (pd.DataFrame): DataFrame contenant les valeurs réelles de test.
+    pred_column (str): Le nom de la colonne des prédictions dans le DataFrame des prédictions.
+    demand_column (str): Le nom de la colonne des valeurs réelles dans le DataFrame de test.
+    upper_bound_column (str): Le nom de la colonne de la borne supérieure dans le DataFrame des prédictions.
+    lower_bound_column (str): Le nom de la colonne de la borne inférieure dans le DataFrame des prédictions.
+    title (str): Titre du graphique.
+    figsize (Tuple[int, int]): Taille de la figure (width, height).
+    """
+
+    fig = go.Figure([
+        go.Scatter(
+            name='Prediction',
+            x=predictions.index,
+            y=predictions[pred_column],
+            mode='lines',
+        ),
+        go.Scatter(
+            name='Real value',
+            x=data_test.index,
+            y=data_test[demand_column],
+            mode='lines',
+        ),
+        go.Scatter(
+            name='Upper Bound',
+            x=predictions.index,
+            y=predictions[upper_bound_column],
+            mode='lines',
+            marker=dict(color="#444"),
+            line=dict(width=0),
+            showlegend=False
+        ),
+        go.Scatter(
+            name='Lower Bound',
+            x=predictions.index,
+            y=predictions[lower_bound_column],
+            marker=dict(color="#444"),
+            line=dict(width=0),
+            mode='lines',
+            fillcolor='rgba(68, 68, 68, 0.3)',
+            fill='tonexty',
+            showlegend=False
+        )
+    ])
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Date time",
+        yaxis_title="Demand",
+        width=figsize[0],
+        height=figsize[1],
+        margin=dict(l=20, r=20, t=35, b=20),
+        hovermode="x",
+        legend=dict(
+            orientation="h",
+            yanchor="top",
+            y=1.1,
+            xanchor="left",
+            x=0.001
+        )
+    )
+
+    fig.show()
 
 
 
